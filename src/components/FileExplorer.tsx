@@ -42,6 +42,11 @@ import {
   pathSeparator,
   updateNode,
 } from "./file-explorer/treeUtils";
+import {
+  APP_SETTINGS_CHANGED_EVENT,
+  DEFAULT_APP_SETTINGS,
+  type AppSettings,
+} from "./app-settings/types";
 
 const COMPACT_EMPTY_FOLDERS_KEY = "nezha.fileExplorer.compactEmptyFolders";
 
@@ -70,6 +75,7 @@ export function FileExplorer({
   width?: number;
 }) {
   const { t } = useI18n();
+  const [settings, setSettings] = useState<AppSettings>(DEFAULT_APP_SETTINGS);
   const [nodes, setNodes] = useState<TreeNode[]>([]);
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -138,6 +144,31 @@ export function FileExplorer({
     [projectPath],
   );
 
+  useEffect(() => {
+    let cancelled = false;
+    const load = () => {
+      invoke<AppSettings>("load_app_settings")
+        .then((loaded) => {
+          if (!cancelled) setSettings(loaded);
+        })
+        .catch(() => {});
+    };
+    load();
+    window.addEventListener(APP_SETTINGS_CHANGED_EVENT, load);
+    return () => {
+      cancelled = true;
+      window.removeEventListener(APP_SETTINGS_CHANGED_EVENT, load);
+    };
+  }, []);
+
+  const defaultIdeId = useMemo(() => {
+    const visible = settings.ide_entries.filter((e) => !e.hidden);
+    const byLast = settings.last_used_ide_id
+      ? visible.find((e) => e.id === settings.last_used_ide_id)?.id ?? null
+      : null;
+    return byLast ?? visible[0]?.id ?? null;
+  }, [settings.ide_entries, settings.last_used_ide_id]);
+
   const closeCtxMenu = useCallback(() => setCtxMenu(null), []);
 
   const openInSystemFolder = useCallback(
@@ -154,6 +185,24 @@ export function FileExplorer({
       }
     },
     [projectPath, showToast, t],
+  );
+
+  const openInIde = useCallback(
+    async (event: React.MouseEvent, path: string) => {
+      event.preventDefault();
+      event.stopPropagation();
+      setCtxMenu(null);
+      if (!defaultIdeId) {
+        showToast(t("file.openInIdeDisabledHint"), "warning");
+        return;
+      }
+      try {
+        await invoke("open_in_ide", { ideId: defaultIdeId, path, projectPath });
+      } catch (error) {
+        showToast(t("file.failedOpenIde", { error: String(error) }), "error");
+      }
+    },
+    [defaultIdeId, projectPath, showToast, t],
   );
 
   const copyPath = useCallback(async (event: React.MouseEvent, path: string, withAt: boolean) => {
@@ -719,6 +768,8 @@ export function FileExplorer({
           onDelete={() => void handleDelete()}
           onOpenInSystem={(event, path) => void openInSystemFolder(event, path)}
           onCopyPath={(event, path, withAt) => void copyPath(event, path, withAt)}
+          onOpenInIde={(event, path) => void openInIde(event, path)}
+          hasIde={Boolean(defaultIdeId)}
         />
       )}
       {/* Header */}

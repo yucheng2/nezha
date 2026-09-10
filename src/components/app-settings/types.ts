@@ -13,6 +13,7 @@ export type NavKey =
   | "shortcuts"
   | "hooks"
   | "skills"
+  | "ide"
   | "about"
   | "thanks"
   | "community"
@@ -56,6 +57,25 @@ export const EMPTY_AGENT_MODEL_CATALOG: AgentModelCatalog = {
   initialized: false,
 };
 
+/** 单个 IDE 启动条目。builtin=true 表示是自动探测出来的常见 IDE(用户不可删,可隐藏);
+ *  builtin=false 表示用户在设置里手动添加的自定义 IDE(可删)。
+ *  command 是带 {file}/{line}/{dir}/{project} 占位符的启动模板。 */
+export interface IdeEntry {
+  id: string;
+  label: string;
+  command: string;
+  builtin: boolean;
+  hidden: boolean;
+}
+
+export const EMPTY_IDE_ENTRY: IdeEntry = {
+  id: "",
+  label: "",
+  command: "",
+  builtin: false,
+  hidden: false,
+};
+
 export interface AppSettings {
   claude_path: string;
   codex_path: string;
@@ -69,6 +89,10 @@ export interface AppSettings {
   use_sideloaded_conpty: boolean;
   claude_model_catalog: AgentModelCatalog;
   codex_model_catalog: AgentModelCatalog;
+  /** 「用 IDE 打开」功能已配置的 IDE 列表 */
+  ide_entries: IdeEntry[];
+  /** 最近一次选择的 IDE id。None 时回落到 ide_entries 中第一个未隐藏条目 */
+  last_used_ide_id: string | null;
 }
 
 /**
@@ -86,6 +110,8 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
   use_sideloaded_conpty: true,
   claude_model_catalog: EMPTY_AGENT_MODEL_CATALOG,
   codex_model_catalog: EMPTY_AGENT_MODEL_CATALOG,
+  ide_entries: [],
+  last_used_ide_id: null,
 };
 
 export interface AgentVersions {
@@ -130,15 +156,35 @@ export interface SkillHubChangedDetail {
  * 而多个 ProjectPage 会同时保持挂载：不带作用域的事件会让所有隐藏页面各开一个对话框，
  * 用户切回那些项目时对话框会凭空出现。带上 `projectId` 后只有该项目的宿主响应；
  * 不带 `projectId`（欢迎页派发）时只有欢迎页宿主响应。
+ *
+ * 来自「用 IDE 打开」下拉的入口想直接落到 IDE 标签页 —— 它派发的是独立的
+ * `OPEN_APP_SETTINGS_WITH_NAV_EVENT`，**不**修改本事件的契约，保持与上游 main 的零耦合。
  */
 export interface OpenAppSettingsDetail {
   projectId?: string;
 }
 
 export function dispatchOpenAppSettings(projectId?: string) {
+  const detail: OpenAppSettingsDetail = projectId ? { projectId } : {};
+  window.dispatchEvent(new CustomEvent<OpenAppSettingsDetail>(OPEN_APP_SETTINGS_EVENT, { detail }));
+}
+
+/**
+ * 本地扩展：与 `OPEN_APP_SETTINGS_EVENT` 同样的作用域规则，但额外携带要打开的 nav 标签。
+ * 这是「用 IDE 打开」下拉点「在设置中管理 IDE」时的派发路径 —— 不动上游事件契约,
+ * SidebarFooterActions 单独多监听一份即可。
+ */
+export const OPEN_APP_SETTINGS_WITH_NAV_EVENT = "nezha:open-app-settings-with-nav";
+
+export interface OpenAppSettingsWithNavDetail {
+  projectId?: string;
+  nav: NavKey;
+}
+
+export function dispatchOpenAppSettingsWithNav(projectId: string | undefined, nav: NavKey) {
+  const detail: OpenAppSettingsWithNavDetail = { nav };
+  if (projectId) detail.projectId = projectId;
   window.dispatchEvent(
-    new CustomEvent<OpenAppSettingsDetail>(OPEN_APP_SETTINGS_EVENT, {
-      detail: projectId ? { projectId } : {},
-    }),
+    new CustomEvent<OpenAppSettingsWithNavDetail>(OPEN_APP_SETTINGS_WITH_NAV_EVENT, { detail }),
   );
 }

@@ -9,7 +9,13 @@ import type {
   FontFamily,
 } from "../types";
 import { AppSettingsDialog } from "./AppSettingsDialog";
-import { OPEN_APP_SETTINGS_EVENT, type OpenAppSettingsDetail } from "./app-settings/types";
+import {
+  OPEN_APP_SETTINGS_EVENT,
+  OPEN_APP_SETTINGS_WITH_NAV_EVENT,
+  type OpenAppSettingsDetail,
+  type OpenAppSettingsWithNavDetail,
+  type NavKey,
+} from "./app-settings/types";
 import { NotificationBell } from "./NotificationBell";
 import { ENABLE_USAGE_INSIGHTS } from "../platform";
 import { UsagePopover } from "./UsagePopover";
@@ -61,16 +67,32 @@ export function SidebarFooterActions({
 }) {
   const { t } = useI18n();
   const [showAppSettings, setShowAppSettings] = useState(false);
+  const [defaultNav, setDefaultNav] = useState<NavKey | undefined>(undefined);
   const isDark = themeVariant === "dark" || themeVariant === "midnight";
 
   useEffect(() => {
+    // 主路径:与上游 main 完全相同的 OPEN_APP_SETTINGS_EVENT 监听器,只读 projectId,
+    // 不读任何额外字段 —— 与 main 同步成本最低。
     const open = (event: Event) => {
-      const target = (event as CustomEvent<OpenAppSettingsDetail | undefined>).detail?.projectId;
-      if (target !== projectId) return;
+      const detail = (event as CustomEvent<OpenAppSettingsDetail | undefined>).detail;
+      if (detail?.projectId !== projectId) return;
+      setDefaultNav(undefined);
+      setShowAppSettings(true);
+    };
+    // 本地扩展:另一个事件专门给 IDE 下拉「在设置中管理」入口用,带 nav 标签。
+    // 与 OPEN_APP_SETTINGS_EVENT 并列监听,不会相互影响。
+    const openWithNav = (event: Event) => {
+      const detail = (event as CustomEvent<OpenAppSettingsWithNavDetail | undefined>).detail;
+      if (detail?.projectId !== projectId) return;
+      setDefaultNav(detail?.nav);
       setShowAppSettings(true);
     };
     window.addEventListener(OPEN_APP_SETTINGS_EVENT, open);
-    return () => window.removeEventListener(OPEN_APP_SETTINGS_EVENT, open);
+    window.addEventListener(OPEN_APP_SETTINGS_WITH_NAV_EVENT, openWithNav);
+    return () => {
+      window.removeEventListener(OPEN_APP_SETTINGS_EVENT, open);
+      window.removeEventListener(OPEN_APP_SETTINGS_WITH_NAV_EVENT, openWithNav);
+    };
   }, [projectId]);
 
   return (
@@ -116,7 +138,11 @@ export function SidebarFooterActions({
           onUiFontFamilyChange={onUiFontFamilyChange}
           monoFontFamily={monoFontFamily}
           onMonoFontFamilyChange={onMonoFontFamilyChange}
-          onClose={() => setShowAppSettings(false)}
+          defaultNav={defaultNav}
+          onClose={() => {
+            setShowAppSettings(false);
+            setDefaultNav(undefined);
+          }}
         />
       )}
     </>

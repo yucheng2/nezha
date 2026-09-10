@@ -102,6 +102,40 @@ pub struct AgentModelCatalog {
     pub source_version: Option<String>,
 }
 
+/// 单个 IDE 条目。builtin=true 表示是自动探测出来的常见 IDE（用户不可删，
+/// 但可隐藏）；builtin=false 表示用户在设置里手动添加的自定义 IDE（可删）。
+///
+/// `command` 是带占位符的启动模板，由 `crate::ide::render_command` 在执行时替换：
+///   {file}   目标文件绝对路径
+///   {line}   目标行号（若调用方提供）
+///   {dir}    目标所在目录（文件时为父目录，目录时为自身）
+///   {project} 目标所在项目根
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct IdeEntry {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub command: String,
+    #[serde(default)]
+    pub builtin: bool,
+    #[serde(default)]
+    pub hidden: bool,
+}
+
+impl Default for IdeEntry {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            label: String::new(),
+            command: String::new(),
+            builtin: false,
+            hidden: false,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct AppSettings {
     #[serde(default)]
@@ -132,6 +166,14 @@ pub struct AppSettings {
     pub claude_model_catalog: AgentModelCatalog,
     #[serde(default)]
     pub codex_model_catalog: AgentModelCatalog,
+    /// 「用 IDE 打开」功能已配置的 IDE 列表。builtin 条目由 detect_ide_entries()
+    /// 写入，自定义条目由用户在应用设置里追加。
+    #[serde(default)]
+    pub ide_entries: Vec<IdeEntry>,
+    /// 用户最近一次选择的 IDE id。前端打开 IDE 时优先用此 id，None 或 id
+    /// 不存在时回落到 ide_entries 中第一个未隐藏的条目。
+    #[serde(default)]
+    pub last_used_ide_id: Option<String>,
 }
 
 impl Default for AppSettings {
@@ -147,6 +189,8 @@ impl Default for AppSettings {
             use_sideloaded_conpty: default_use_sideloaded_conpty(),
             claude_model_catalog: AgentModelCatalog::default(),
             codex_model_catalog: AgentModelCatalog::default(),
+            ide_entries: Vec::new(),
+            last_used_ide_id: None,
         }
     }
 }
@@ -511,7 +555,383 @@ fn normalize_settings(settings: AppSettings) -> AppSettings {
         use_sideloaded_conpty: settings.use_sideloaded_conpty,
         claude_model_catalog: normalize_catalog(settings.claude_model_catalog),
         codex_model_catalog: normalize_catalog(settings.codex_model_catalog),
+        // 去重 + 清洗:同一 id 只保留首条;空白 id / command / label 视为无效丢弃
+        // (builtin 条目若变成无效条目也会被丢,但探测函数会重新补回)。
+        ide_entries: normalize_ide_entries(settings.ide_entries),
+        last_used_ide_id: settings
+            .last_used_ide_id
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
     }
+}
+
+fn normalize_ide_entries(entries: Vec<IdeEntry>) -> Vec<IdeEntry> {
+    let mut seen = std::collections::HashSet::new();
+    entries
+        .into_iter()
+        .filter_map(|mut e| {
+            e.id = e.id.trim().to_string();
+            e.label = e.label.trim().to_string();
+            e.command = e.command.trim().to_string();
+            if e.id.is_empty() || e.command.is_empty() || e.label.is_empty() {
+                return None;
+            }
+            if !seen.insert(e.id.clone()) {
+                return None;
+            }
+            Some(e)
+        })
+        .collect()
+}
+
+/// 内置 IDE 候选列表。顺序即用户在设置面板里看到的顺序,
+/// 也是探测时的优先级顺序(命中即保留)。
+///
+/// 元组: `(id, label, command_template, fallback_paths)`
+/// - `command_template` 占位符 `{file}` `{line}` `{dir}` `{project}` 由 `ide.rs::render_command` 替换。
+/// - `fallback_paths` 是「PATH 探测失败后」再尝试的绝对路径列表,主要给 macOS .app bundle 内嵌 cli 用
+///   (如 Zed.app/Contents/MacOS/cli,这种 binary 一般不会装到 /usr/local/bin)。
+///   模板里不出现 `{line}` 的(Vim/Emacs/Neovim 等)只打开文件,不跳行 —— 它们 CLI 不原生支持。
+fn builtin_ide_specs() -> &'static [BuiltinIdeSpec] {
+    BUILTIN_IDE_SPECS
+}
+
+const BUILTIN_IDE_SPECS: &[BuiltinIdeSpec] = &[
+    // ── VS Code 家族 ──
+    // VS Code / VS Code Insiders / Codium 都会自动把 `code` / `codium` 注册到 PATH
+    spec("code", "VS Code", "code --goto {file}:{line}", EMPTY_FALLBACK),
+    spec(
+        "code-insiders",
+        "VS Code Insiders",
+        "code-insiders --goto {file}:{line}",
+        EMPTY_FALLBACK,
+    ),
+    // Cursor 安装在 /Applications/Cursor.app,内嵌 cli
+    spec("cursor", "Cursor", "cursor {file}", CURSOR_APP_PATHS),
+    spec("codium", "VS Codium", "codium --goto {file}:{line}", EMPTY_FALLBACK),
+    spec(
+        "codium-insiders",
+        "VS Codium Insiders",
+        "codium-insiders --goto {file}:{line}",
+        EMPTY_FALLBACK,
+    ),
+    spec("windsurf", "Windsurf", "windsurf {file}:{line}", WINDSURF_APP_PATHS),
+    spec("trae", "Trae", "trae --goto {file}:{line}", TRAE_APP_PATHS),
+    spec(
+        "antigravity",
+        "Antigravity",
+        "antigravity {file}:{line}",
+        ANTIGRAVITY_APP_PATHS,
+    ),
+    // ── JetBrains 全家桶(都用 Launcher 提供的同名 CLI,行号参数一致)──
+    spec(
+        "webstorm",
+        "WebStorm",
+        "webstorm --line {line} {file}",
+        JETBRAINS_BIN_DIRS,
+    ),
+    spec(
+        "idea",
+        "IntelliJ IDEA",
+        "idea --line {line} {file}",
+        JETBRAINS_BIN_DIRS,
+    ),
+    spec(
+        "clion",
+        "CLion",
+        "clion --line {line} {file}",
+        JETBRAINS_BIN_DIRS,
+    ),
+    spec(
+        "pycharm",
+        "PyCharm",
+        "pycharm --line {line} {file}",
+        JETBRAINS_BIN_DIRS,
+    ),
+    spec(
+        "phpstorm",
+        "PhpStorm",
+        "phpstorm --line {line} {file}",
+        JETBRAINS_BIN_DIRS,
+    ),
+    spec(
+        "goland",
+        "GoLand",
+        "goland --line {line} {file}",
+        JETBRAINS_BIN_DIRS,
+    ),
+    spec(
+        "rider",
+        "Rider",
+        "rider --line {line} {file}",
+        JETBRAINS_BIN_DIRS,
+    ),
+    spec(
+        "rubymine",
+        "RubyMine",
+        "rubymine --line {line} {file}",
+        JETBRAINS_BIN_DIRS,
+    ),
+    spec(
+        "datagrip",
+        "DataGrip",
+        "datagrip --line {line} {file}",
+        JETBRAINS_BIN_DIRS,
+    ),
+    spec(
+        "studio",
+        "Android Studio",
+        "studio --line {line} {file}",
+        JETBRAINS_BIN_DIRS,
+    ),
+    // ── 国产 AI IDE ──
+    spec("codebuddy", "CodeBuddy", "codebuddy {file}", CODEBUDDY_PATHS),
+    // ── 终端向编辑器 ──
+    // Zed 内嵌 cli,macOS 和 Linux 安装位置都不一定在 PATH
+    spec("zed", "Zed", "zed {file}:{line}", ZED_APP_PATHS),
+    spec("hx", "Helix", "hx {file}:{line}", EMPTY_FALLBACK),
+    spec("nvim", "Neovim", "nvim {file}", EMPTY_FALLBACK),
+    spec("vim", "Vim", "vim {file}", EMPTY_FALLBACK),
+    spec("mvim", "MacVim", "mvim {file}", EMPTY_FALLBACK),
+    spec("emacs", "Emacs", "emacs {file}", EMPTY_FALLBACK),
+    spec("emacsclient", "Emacsclient", "emacsclient -n {file}", EMPTY_FALLBACK),
+    // ── 其他 GUI 编辑器 ──
+    spec("subl", "Sublime Text", "subl {file}:{line}", EMPTY_FALLBACK),
+    spec("mate", "TextMate", "mate {file}:{line}", EMPTY_FALLBACK),
+    spec("bbedit", "BBEdit", "bbedit {file}:{line}", EMPTY_FALLBACK),
+    spec("kate", "Kate", "kate -l {line} {file}", EMPTY_FALLBACK),
+];
+
+/// builtin spec 的运行时结构。`fallback_paths` 只在 PATH 探测失败时使用。
+struct BuiltinIdeSpec {
+    id: &'static str,
+    label: &'static str,
+    command: &'static str,
+    fallback_paths: &'static [&'static str],
+}
+
+/// 让 builtin_ide_specs() 里的 spec(...) 字面量能直接转成 BuiltinIdeSpec。所有 builtin
+/// spec 本身都是 const(只借用 'static),不需要在堆上分配。
+const fn spec(
+    id: &'static str,
+    label: &'static str,
+    command: &'static str,
+    fallback_paths: &'static [&'static str],
+) -> BuiltinIdeSpec {
+    BuiltinIdeSpec {
+        id,
+        label,
+        command,
+        fallback_paths,
+    }
+}
+
+const EMPTY_FALLBACK: &[&str] = &[];
+
+// ── builtin IDE 的「绝对路径」fallback 候选 ─────────────────────────────────
+// 路径里的 `~/` 在 `detect_at_paths` 里展开为 `$HOME`。以下位置不一定都在 PATH 上,
+// 但都是各家 IDE 的标准/常见安装路径。
+
+/// Cursor 安装在 /Applications/Cursor.app,内嵌 cli 路径有两套历史位置。
+const CURSOR_APP_PATHS: &[&str] = &[
+    "/Applications/Cursor.app/Contents/Resources/app/bin/cursor",
+    "/Applications/Cursor.app/Contents/MacOS/cursor",
+];
+
+/// Windsurf / Antigravity / Trae / Zed 都用 Electron,内嵌 cli 统一在
+/// `/Applications/<Name>.app/Contents/MacOS/cli`。多列几条 .app 名变体兼容不同发布渠道。
+const WINDSURF_APP_PATHS: &[&str] = &[
+    "/Applications/Windsurf.app/Contents/MacOS/cli",
+];
+const ANTIGRAVITY_APP_PATHS: &[&str] = &[
+    "/Applications/Antigravity.app/Contents/MacOS/cli",
+];
+const TRAE_APP_PATHS: &[&str] = &[
+    "/Applications/Trae.app/Contents/MacOS/cli",
+    "/Applications/Trae CN.app/Contents/MacOS/cli",
+];
+const ZED_APP_PATHS: &[&str] = &[
+    "/Applications/Zed.app/Contents/MacOS/cli",
+    "/Applications/Zed Preview.app/Contents/MacOS/cli",
+];
+
+/// JetBrains Toolbox 在不同 OS 上的 CLI 目录。探测时把 `{bin}` 拼到每个目录后面。
+const JETBRAINS_BIN_DIRS: &[&str] = &[
+    "~/.local/share/JetBrains/Toolbox/bin",
+    "~/Library/Application Support/JetBrains/Toolbox/bin",
+];
+
+/// 腾讯 CodeBuddy CLI 默认装到 `~/.local/bin/codebuddy`(参见
+/// https://www.codebuddy.cn/docs/cli/installation)。脚本会顺手改 shell rc,
+/// 但用户用非默认 shell 时不一定生效,所以仍然探测一下。
+const CODEBUDDY_PATHS: &[&str] = &[
+    "~/.local/bin/codebuddy",
+];
+
+/// 探测「绝对路径」候选。PATH 探测失败时用这条回退。
+///
+/// 支持两种路径写法:
+/// - 绝对路径 `/Applications/...` —— 直接判存在
+/// - 家目录缩写 `~/...` —— 用 `$HOME` 展开后再判存在
+///
+/// 返回首个存在的路径;都失败返回空字符串(与 `detect_path` 的返回约定一致)。
+fn detect_at_paths(fallback_paths: &[&str]) -> String {
+    let home = std::env::var_os("HOME").map(|h| h.to_string_lossy().into_owned());
+    for raw in fallback_paths {
+        // raw: &&str(因迭代 &[&str])
+        let expanded = if let Some(stripped) = raw.strip_prefix("~/") {
+            let Some(ref h) = home else {
+                continue;
+            };
+            format!("{}/{}", h, stripped)
+        } else if *raw == "~" {
+            match home {
+                Some(ref h) => h.clone(),
+                None => continue,
+            }
+        } else {
+            (*raw).to_string()
+        };
+        if std::path::Path::new(&expanded).is_file() {
+            return expanded;
+        }
+        // Windows 上 .exe 后缀容错
+        #[cfg(target_os = "windows")]
+        {
+            let with_exe = format!("{expanded}.exe");
+            if std::path::Path::new(&with_exe).is_file() {
+                return with_exe;
+            }
+        }
+    }
+    String::new()
+}
+
+/// JetBrains 专用:在 Toolbox bin 目录下找 `<id>` 这个 binary。
+fn detect_jetbrains(id: &str) -> String {
+    let home = match std::env::var_os("HOME") {
+        Some(h) => h.to_string_lossy().into_owned(),
+        None => return String::new(),
+    };
+    for dir in JETBRAINS_BIN_DIRS {
+        let expanded = if let Some(stripped) = dir.strip_prefix("~/") {
+            format!("{home}/{stripped}")
+        } else {
+            (*dir).to_string()
+        };
+        let candidate = std::path::Path::new(&expanded).join(id);
+        if candidate.is_file() {
+            return candidate.to_string_lossy().into_owned();
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let with_exe = candidate.with_extension("exe");
+            if with_exe.is_file() {
+                return with_exe.to_string_lossy().into_owned();
+            }
+        }
+    }
+    String::new()
+}
+
+/// 探测系统上已安装的 IDE。每个 builtin spec 走三段探测:
+/// 1. `crate::platform::detect_path` —— 走 PATH(用户装了 shell command 之后)
+/// 2. `detect_at_paths` —— 走 spec 自带的 fallback 绝对路径(macOS .app bundle 等)
+/// 3. `detect_jetbrains` —— JetBrains Toolbox bin 目录(对 webstorm/idea/clion/... 等)
+///   注意：同名 Tauri 命令 `detect_ide_entries`（pub async fn）需要这个函数,
+///   改名为 scan_ide_entries 避免命名冲突。
+fn scan_ide_entries() -> Vec<IdeEntry> {
+    builtin_ide_specs()
+        .iter()
+        .filter_map(|s| {
+            let detected = detect_path(s.id);
+            let detected = if detected.is_empty() {
+                detect_at_paths(s.fallback_paths)
+            } else {
+                detected
+            };
+            let detected = if detected.is_empty() && is_jetbrains_id(s.id) {
+                detect_jetbrains(s.id)
+            } else {
+                detected
+            };
+            if detected.is_empty() {
+                None
+            } else {
+                // 仅对 PATH 探测显示 found 路径;绝对路径发现的不暴露绝对路径(避免 UI 看着像乱码)。
+                // 真正启动时 `open_in_ide` 走的还是 spec.command(program 部分),所以这里只是日志参考。
+                let _ = detected;
+                Some(IdeEntry {
+                    id: s.id.to_string(),
+                    label: s.label.to_string(),
+                    command: s.command.to_string(),
+                    builtin: true,
+                    hidden: false,
+                })
+            }
+        })
+        .collect()
+}
+
+/// 是否属于 JetBrains 全家桶(用于走 `detect_jetbrains` 的 Toolbox bin 探测)。
+fn is_jetbrains_id(id: &str) -> bool {
+    matches!(
+        id,
+        "webstorm"
+            | "idea"
+            | "clion"
+            | "pycharm"
+            | "phpstorm"
+            | "goland"
+            | "rider"
+            | "rubymine"
+            | "datagrip"
+            | "studio"
+    )
+}
+
+/// 用新探测结果更新现有 ide_entries：
+/// - 已存在的 builtin id 保留 hidden 状态与自定义 command
+/// - 新探测到的 builtin id 追加
+/// - 用户自定义条目(builtin=false)始终保留
+/// - 旧 builtin=true 但已不再被探测到(用户可能改过 PATH / 装在非标准位置)的条目也保留
+fn merge_ide_entries(existing: Vec<IdeEntry>) -> Vec<IdeEntry> {
+    let detected = scan_ide_entries();
+    let detected_ids: std::collections::HashSet<String> =
+        detected.iter().map(|e| e.id.clone()).collect();
+    let mut merged = Vec::new();
+    // 1. 保留所有 builtin=false 的自定义条目
+    for entry in existing.iter() {
+        if !entry.builtin {
+            merged.push(entry.clone());
+        }
+    }
+    // 2. 按 builtin_ide_specs() 顺序追加 builtin 条目(包含已存在和新增)
+    for new_entry in detected {
+        if let Some(old) = existing.iter().find(|e| e.id == new_entry.id && e.builtin) {
+            merged.push(IdeEntry {
+                hidden: old.hidden,
+                command: if old.command.is_empty() {
+                    new_entry.command
+                } else {
+                    old.command.clone()
+                },
+                ..new_entry
+            });
+        } else {
+            merged.push(new_entry);
+        }
+    }
+    // 3. 保留 builtin=true 但当前未被探测到的旧条目(用户可能改了 PATH)
+    for entry in existing.iter() {
+        if entry.builtin
+            && !detected_ids.contains(&entry.id)
+            && !merged.iter().any(|m| m.id == entry.id)
+        {
+            merged.push(entry.clone());
+        }
+    }
+    merged
 }
 
 fn load_settings_unlocked() -> AppSettings {
@@ -532,6 +952,8 @@ fn load_settings_unlocked() -> AppSettings {
             use_sideloaded_conpty: default_use_sideloaded_conpty(),
             claude_model_catalog: AgentModelCatalog::default(),
             codex_model_catalog: AgentModelCatalog::default(),
+            ide_entries: scan_ide_entries(),
+            last_used_ide_id: None,
         });
         if let Ok(dir) = nezha_dir() {
             let _ = fs::create_dir_all(&dir);
@@ -935,6 +1357,55 @@ pub async fn detect_agent_paths() -> Result<AppSettings, String> {
     .map_err(|e| e.to_string())?
 }
 
+#[tauri::command]
+pub async fn save_ide_entries(
+    entries: Vec<IdeEntry>,
+    last_used_id: Option<String>,
+) -> Result<AppSettings, String> {
+    tokio::task::spawn_blocking(move || {
+        let normalized = {
+            let _guard = settings_lock().lock();
+            let mut settings = load_settings_unlocked();
+            // 自定义条目(UUID id)由前端生成;此处用 normalize_ide_entries 清洗 + 去重
+            settings.ide_entries = entries;
+            settings.last_used_ide_id = last_used_id;
+
+            let dir = nezha_dir()?;
+            fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+            let path = settings_path()?;
+            let normalized = normalize_settings(settings);
+            let raw = serde_json::to_string_pretty(&normalized).map_err(|e| e.to_string())?;
+            atomic_write(&path, &raw)?;
+            normalized
+        };
+        Ok::<AppSettings, String>(normalized)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn detect_ide_entries() -> Result<AppSettings, String> {
+    tokio::task::spawn_blocking(|| {
+        let normalized = {
+            let _guard = settings_lock().lock();
+            let mut settings = load_settings_unlocked();
+            settings.ide_entries = merge_ide_entries(std::mem::take(&mut settings.ide_entries));
+
+            let dir = nezha_dir()?;
+            fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+            let path = settings_path()?;
+            let normalized = normalize_settings(settings);
+            let raw = serde_json::to_string_pretty(&normalized).map_err(|e| e.to_string())?;
+            atomic_write(&path, &raw)?;
+            normalized
+        };
+        Ok::<AppSettings, String>(normalized)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 fn detect_version(launch: &AgentLaunchSpec) -> Option<String> {
     let mut cmd = Command::new(&launch.program);
     crate::subprocess::configure_background_command(&mut cmd);
@@ -1106,5 +1577,71 @@ mod model_catalog_tests {
             default_reasoning_effort: None,
         }])
         .is_err());
+    }
+}
+
+#[cfg(test)]
+mod ide_detection_tests {
+    use super::*;
+
+    #[test]
+    fn detect_at_paths_returns_empty_for_unknown_paths() {
+        // 不存在的绝对路径 → 空字符串,绝不 panic
+        assert_eq!(
+            detect_at_paths(&["/this/path/definitely/does/not/exist/xyz_abc_999"]),
+            ""
+        );
+        // ~/ 展开后也不存在 → 空
+        assert_eq!(detect_at_paths(&["~/__nonexistent_zed_path_xyz__"]), "");
+        // ~ 单字符没有 HOME 也不该 panic
+        assert_eq!(detect_at_paths(&["~"]), "");
+    }
+
+    #[test]
+    fn detect_jetbrains_returns_empty_for_unknown_bin() {
+        // 不存在的 JetBrains bin → 空字符串,不 panic
+        assert!(detect_jetbrains("nonexistent_jetbrains_tool_xyz_999").is_empty());
+    }
+
+    #[test]
+    fn builtin_ide_specs_contains_zed_and_codebuddy() {
+        // 这两个是用户明确点名要的,必须出现在 builtin 里
+        let ids: Vec<&str> = BUILTIN_IDE_SPECS.iter().map(|s| s.id).collect();
+        assert!(ids.contains(&"zed"), "zed builtin spec missing");
+        assert!(ids.contains(&"codebuddy"), "codebuddy builtin spec missing");
+        assert!(ids.contains(&"trae"), "trae builtin spec missing");
+        assert!(ids.contains(&"cursor"), "cursor builtin spec missing");
+    }
+
+    #[test]
+    fn zed_spec_has_fallback_paths() {
+        let s = BUILTIN_IDE_SPECS
+            .iter()
+            .find(|s| s.id == "zed")
+            .expect("zed spec");
+        assert!(
+            !s.fallback_paths.is_empty(),
+            "zed 应该配 fallback 绝对路径,因为 CLI 在 .app bundle 里,可能不在 PATH"
+        );
+    }
+
+    #[test]
+    fn is_jetbrains_id_recognizes_all_bundle() {
+        for id in [
+            "webstorm",
+            "idea",
+            "clion",
+            "pycharm",
+            "phpstorm",
+            "goland",
+            "rider",
+            "rubymine",
+            "datagrip",
+            "studio",
+        ] {
+            assert!(is_jetbrains_id(id), "{} should be jetbrains", id);
+        }
+        assert!(!is_jetbrains_id("code"));
+        assert!(!is_jetbrains_id("zed"));
     }
 }

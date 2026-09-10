@@ -22,6 +22,8 @@ function renderMenu(x: number, y: number) {
         onDelete={noop}
         onOpenInSystem={noop}
         onCopyPath={noop}
+        onOpenInIde={noop}
+        hasIde={true}
       />
     </I18nProvider>,
   );

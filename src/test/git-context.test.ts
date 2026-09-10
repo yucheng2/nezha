@@ -23,6 +23,18 @@ describe("resolveProjectGitContext", () => {
     });
   });
 
+  it("commandRepoPath is the path IDE / git commands should open (worktree)", () => {
+    // 回归测试:之前误把 displayedRepoPath 传给了 RightToolbar,
+    // 导致打开任务视图时 IDE 打开的是主仓,不是 worktree。
+    // 正确的 IDE 目标路径是 commandRepoPath。
+    const ctx = resolveProjectGitContext("/workspace", "/workspace/web", {
+      worktreeRepo: "/workspace/api",
+      worktreePath: "/workspace/.nezha/worktrees/task-1",
+    });
+    expect(ctx.commandRepoPath).toBe("/workspace/.nezha/worktrees/task-1");
+    expect(ctx.displayedRepoPath).toBe("/workspace/api"); // 仅 RepoSelector 用
+  });
+
   it("falls back to the owner repository after a worktree is discarded", () => {
     expect(
       resolveProjectGitContext("/workspace", "/workspace/web", {

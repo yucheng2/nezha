@@ -13,6 +13,8 @@ export function FileExplorerContextMenu({
   onDelete,
   onOpenInSystem,
   onCopyPath,
+  onOpenInIde,
+  hasIde,
 }: {
   ctxMenu: ContextMenuState;
   onClose: () => void;
@@ -21,6 +23,8 @@ export function FileExplorerContextMenu({
   onDelete: () => void;
   onOpenInSystem: (e: React.MouseEvent, path: string) => void;
   onCopyPath: (e: React.MouseEvent, path: string, withAt: boolean) => void;
+  onOpenInIde: (e: React.MouseEvent, path: string) => void;
+  hasIde: boolean;
 }) {
   const { t } = useI18n();
   const menuRef = useRef<HTMLDivElement>(null);
@@ -56,6 +60,7 @@ export function FileExplorerContextMenu({
     { label: t("file.newFile"), action: "newFile" },
     { label: t("file.newFolder"), action: "newFolder" },
     { action: "separator" },
+    { label: t("file.openInIde"), action: "openInIde", disabled: !hasIde, disabledHint: t("file.openInIdeDisabledHint") },
     { label: t("file.openInSystemFolder"), action: "open" },
     { label: t("file.copyFullPath"), action: "copy", withAt: false },
     { label: t("file.copyAtFullPath"), action: "copy", withAt: true },
@@ -92,6 +97,7 @@ export function FileExplorerContextMenu({
             return <div key={`sep-${idx}`} style={s.fileCtxSeparator} />;
           }
           const isDestructive = item.action === "delete";
+          const isDisabled = "disabled" in item && item.disabled;
           const baseColor = isDestructive
             ? "var(--danger-action-bg, #d23f3f)"
             : "var(--text-primary)";
@@ -99,7 +105,18 @@ export function FileExplorerContextMenu({
             <button
               type="button"
               key={item.label}
-              style={{ ...s.fileCtxMenuItem, color: baseColor }}
+              disabled={Boolean(isDisabled)}
+              title={
+                isDisabled && "disabledHint" in item && typeof item.disabledHint === "string"
+                  ? item.disabledHint
+                  : undefined
+              }
+              style={{
+                ...s.fileCtxMenuItem,
+                color: isDisabled ? "var(--text-hint)" : baseColor,
+                opacity: isDisabled ? 0.55 : 1,
+                cursor: isDisabled ? "not-allowed" : "pointer",
+              }}
               onMouseEnter={(e) => {
                 e.currentTarget.style.background = isDestructive
                   ? "var(--danger-action-bg, #d23f3f)"
@@ -133,6 +150,11 @@ export function FileExplorerContextMenu({
                 }
                 if (item.action === "open") {
                   onOpenInSystem(event, ctxMenu.path);
+                  return;
+                }
+                if (item.action === "openInIde") {
+                  if (!hasIde) return; // 防御性二次检查,按钮已 disabled
+                  onOpenInIde(event, ctxMenu.path);
                   return;
                 }
                 if (item.action === "copy") {

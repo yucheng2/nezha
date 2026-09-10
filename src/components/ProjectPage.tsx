@@ -644,6 +644,9 @@ export function ProjectPage({
         onOpenSearch={() => setShowFileSearch(true)}
         onOpenSettings={() => setShowSettings(true)}
         showSkillStore={!hubMode}
+        projectPath={project.path}
+        targetPath={gitContextPath}
+        projectId={project.id}
       />
 
       {showFileSearch && (
