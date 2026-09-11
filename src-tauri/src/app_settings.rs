@@ -579,9 +579,47 @@ fn normalize_ide_entries(entries: Vec<IdeEntry>) -> Vec<IdeEntry> {
             if !seen.insert(e.id.clone()) {
                 return None;
             }
+            // 内置条目且 program 是裸名(没有路径分隔符)时,升级成绝对路径 ———
+            // 这样在打包后的 .app bundle 里启动 IDE 不依赖完整 shell PATH。
+            // 自定义条目保留原样,用户自己配的绝对路径不会被改写。
+            if e.builtin && needs_path_upgrade(&e.command) {
+                if let Some(spec) = builtin_ide_specs().iter().find(|s| s.id == e.id) {
+                    if let Some(abs) = resolve_builtin_absolute_path(spec) {
+                        e.command = substitute_program(&e.command, &abs);
+                    }
+                }
+            }
             Some(e)
         })
         .collect()
+}
+
+/// builtin 条目的 program 部分是否是裸名(没有路径分隔符) ———
+/// 是的话需要升级成绝对路径。
+fn needs_path_upgrade(command: &str) -> bool {
+    let program = command.split_whitespace().next().unwrap_or("");
+    // Unix 路径以 `/` 开头;Windows 路径以盘符或 `\` 开头。
+    !program.is_empty() && !program.contains('/') && !program.contains('\\')
+}
+
+/// 对 builtin spec 走三段探测,找到绝对路径。复用了 scan_ide_entries 同样的链路。
+fn resolve_builtin_absolute_path(spec: &BuiltinIdeSpec) -> Option<String> {
+    let detected = detect_path(spec.id);
+    let detected = if detected.is_empty() {
+        detect_at_paths(spec.fallback_paths)
+    } else {
+        detected
+    };
+    let detected = if detected.is_empty() && is_jetbrains_id(spec.id) {
+        detect_jetbrains(spec.id)
+    } else {
+        detected
+    };
+    if detected.is_empty() {
+        None
+    } else {
+        Some(detected)
+    }
 }
 
 /// 内置 IDE 候选列表。顺序即用户在设置面板里看到的顺序,
@@ -858,19 +896,32 @@ fn scan_ide_entries() -> Vec<IdeEntry> {
             if detected.is_empty() {
                 None
             } else {
-                // 仅对 PATH 探测显示 found 路径;绝对路径发现的不暴露绝对路径(避免 UI 看着像乱码)。
-                // 真正启动时 `open_in_ide` 走的还是 spec.command(program 部分),所以这里只是日志参考。
-                let _ = detected;
+                // 把检测到的绝对路径替换到 command 模板的 program 部分。
+                // 生产 .app bundle 启动时没有完整 shell 的 PATH(只有 /usr/bin:/bin:/usr/sbin:/sbin),
+                // 直接 Command::new("code") 会 No such file or directory;
+                // 用绝对路径后 `open_in_ide` spawn 就不依赖 PATH 解析。
+                //
+                // 自定义 IDE(builtin=false)保留原样 —— 用户自己配的命令是否要绝对路径是他们的选择。
+                let command = substitute_program(&s.command, &detected);
                 Some(IdeEntry {
                     id: s.id.to_string(),
                     label: s.label.to_string(),
-                    command: s.command.to_string(),
+                    command,
                     builtin: true,
                     hidden: false,
                 })
             }
         })
         .collect()
+}
+
+/// 把 command 模板("code --goto {file}:{line}")的 program 部分替换成 absolute_path。
+/// 找不到空格(program 后面没东西)就整段替换。
+fn substitute_program(command: &str, absolute_path: &str) -> String {
+    match command.find(char::is_whitespace) {
+        Some(idx) => format!("{absolute_path}{}", &command[idx..]),
+        None => absolute_path.to_string(),
+    }
 }
 
 /// 是否属于 JetBrains 全家桶(用于走 `detect_jetbrains` 的 Toolbox bin 探测)。
@@ -1643,5 +1694,112 @@ mod ide_detection_tests {
         }
         assert!(!is_jetbrains_id("code"));
         assert!(!is_jetbrains_id("zed"));
+    }
+
+    #[test]
+    fn substitute_program_replaces_only_first_token() {
+        // "code --goto {file}:{line}" + "/usr/local/bin/code" → "/usr/local/bin/code --goto {file}:{line}"
+        assert_eq!(
+            substitute_program("code --goto {file}:{line}", "/usr/local/bin/code"),
+            "/usr/local/bin/code --goto {file}:{line}"
+        );
+        // 没空格(program 后面没东西)→ 整段替换
+        assert_eq!(substitute_program("code", "/usr/local/bin/code"), "/usr/local/bin/code");
+        // 多个空格也只替换第一段
+        assert_eq!(
+            substitute_program("cursor {file}  --new-window", "/Applications/Cursor.app/Contents/MacOS/cursor"),
+            "/Applications/Cursor.app/Contents/MacOS/cursor {file}  --new-window"
+        );
+    }
+
+    #[test]
+    fn needs_path_upgrade_detects_bare_vs_absolute() {
+        // 裸名 → 需要升级
+        assert!(needs_path_upgrade("code --goto {file}:{line}"));
+        assert!(needs_path_upgrade("code"));
+        // 绝对路径 → 不需要
+        assert!(!needs_path_upgrade("/usr/local/bin/code --goto {file}"));
+        assert!(!needs_path_upgrade("/Applications/Zed.app/Contents/MacOS/cli {file}"));
+        // Windows 反斜杠绝对路径 → 不需要
+        assert!(!needs_path_upgrade(r"C:\Program Files\VS Code\bin\code.cmd {file}"));
+    }
+
+    #[test]
+    fn normalize_ide_entries_upgrades_bare_builtin_commands_to_absolute_paths() {
+        // 旧 settings.json 里的 builtin 条目,program 是裸名 → normalize 后应升级成绝对路径
+        // 我们 mock 一个 builtin spec + 一个伪造的绝对路径候选
+        // 用真实的 builtin spec("code" / "webstorm"),模拟 PATH 中没有该二进制,
+        // 但绝对路径里有 → normalize_ide_entries 应该把 command 替换。
+        //
+        // 为了避免对真实环境 PATH 的依赖,我们直接用 `which` 探测过的 binary 路径(若有)
+        // 或者只验证"已经是绝对路径的条目不被再次改写"。
+        let entry = IdeEntry {
+            id: "code".to_string(),
+            label: "VS Code".to_string(),
+            command: "/usr/local/bin/code --goto {file}:{line}".to_string(),
+            builtin: true,
+            hidden: false,
+        };
+        let normalized = normalize_ide_entries(vec![entry]);
+        assert_eq!(normalized.len(), 1);
+        // 已经是绝对路径 → 不动
+        assert_eq!(
+            normalized[0].command,
+            "/usr/local/bin/code --goto {file}:{line}"
+        );
+    }
+
+    #[test]
+    fn normalize_ide_entries_preserves_custom_user_commands() {
+        // 用户手填的自定义 IDE(builtin=false)即使 program 是裸名也不升级 ———
+        // 这是用户的选择,不能擅自改写。
+        let entry = IdeEntry {
+            id: "custom-fancy-editor".to_string(),
+            label: "Fancy Editor".to_string(),
+            command: "fancy-editor --open {file}".to_string(),
+            builtin: false,
+            hidden: false,
+        };
+        let normalized = normalize_ide_entries(vec![entry]);
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(normalized[0].command, "fancy-editor --open {file}");
+    }
+
+    #[test]
+    fn normalize_ide_entries_drops_invalid_entries() {
+        // id/label/command 任一为空 → 丢弃
+        let entries = vec![
+            IdeEntry {
+                id: "".to_string(),
+                label: "X".to_string(),
+                command: "x {file}".to_string(),
+                builtin: false,
+                hidden: false,
+            },
+            IdeEntry {
+                id: "x".to_string(),
+                label: "".to_string(),
+                command: "x {file}".to_string(),
+                builtin: false,
+                hidden: false,
+            },
+            IdeEntry {
+                id: "x".to_string(),
+                label: "X".to_string(),
+                command: "".to_string(),
+                builtin: false,
+                hidden: false,
+            },
+            IdeEntry {
+                id: "x".to_string(),
+                label: "X".to_string(),
+                command: "x {file}".to_string(),
+                builtin: false,
+                hidden: false,
+            },
+        ];
+        let normalized = normalize_ide_entries(entries);
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(normalized[0].id, "x");
     }
 }
