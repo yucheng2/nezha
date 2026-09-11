@@ -579,13 +579,35 @@ fn normalize_ide_entries(entries: Vec<IdeEntry>) -> Vec<IdeEntry> {
             if !seen.insert(e.id.clone()) {
                 return None;
             }
-            // 内置条目且 program 是裸名(没有路径分隔符)时,升级成绝对路径 ———
-            // 这样在打包后的 .app bundle 里启动 IDE 不依赖完整 shell PATH。
-            // 自定义条目保留原样,用户自己配的绝对路径不会被改写。
-            if e.builtin && needs_path_upgrade(&e.command) {
+            // builtin 条目迁移:
+// 1) program 是裸名 → 走 resolve_builtin_absolute_path 拿绝对路径并替换
+//    (生产 .app bundle 启动不依赖完整 shell PATH)
+// 2) 是 JetBrains Toolbox launcher 路径 → 用 .app bundle 直探测替换
+//    (Toolbox launcher 经常坏 —— 硬编码指了已删除的 IDE 版本,
+//    这是用户在 2026-09-11 遇到的具体场景)
+//    Toolbox launcher 的路径已知(`JetBrains/Toolbox/scripts/<id>` 或
+//    `JetBrains/Toolbox/bin/<id>`),直接用 marker 子串定位 program 起点。
+            if e.builtin {
                 if let Some(spec) = builtin_ide_specs().iter().find(|s| s.id == e.id) {
-                    if let Some(abs) = resolve_builtin_absolute_path(spec) {
-                        e.command = substitute_program(&e.command, &abs);
+                    if needs_path_upgrade(&e.command) {
+                        if let Some(abs) = resolve_builtin_absolute_path(spec) {
+                            e.command = substitute_program(&e.command, &abs);
+                        }
+                    } else if is_jetbrains_id(&e.id)
+                        && is_toolbox_launcher_path(&e.command)
+                    {
+                        if let Some(abs) = detect_jetbrains_app_bundle(&e.id) {
+                            if let Some((start, end)) =
+                                toolbox_program_span(&e.command, &e.id)
+                            {
+                                e.command = format!(
+                                    "{}{}{}",
+                                    &e.command[..start],
+                                    abs,
+                                    &e.command[end..]
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -600,6 +622,63 @@ fn needs_path_upgrade(command: &str) -> bool {
     let program = command.split_whitespace().next().unwrap_or("");
     // Unix 路径以 `/` 开头;Windows 路径以盘符或 `\` 开头。
     !program.is_empty() && !program.contains('/') && !program.contains('\\')
+}
+
+/// builtin 条目的 program 路径是否是 JetBrains Toolbox launcher ——
+/// launcher 经常因版本变化(指了已删除的 IDE)而坏。
+/// 是的话 migrate 到 .app bundle 直探测的结果。
+///
+/// 注意:不能用 `split_whitespace().next()` 提取 program —— 路径里有空格
+/// (如 `/Users/x/Library/Application Support/...`)会被截断。直接 substr 包含检查更可靠。
+fn is_toolbox_launcher_path(command: &str) -> bool {
+    command.contains("JetBrains/Toolbox/")
+        || command.contains("JetBrains\\Toolbox\\")
+        || command.contains("JetBrains/Toolbox/bin")
+}
+
+/// 给定一条包含 Toolbox launcher 的 command 字符串,定位**完整 program** 的字节范围。
+///
+/// 已知形态(来自 JETBRAINS_BIN_DIRS / scripts 目录):
+/// - `/Users/x/Library/Application Support/JetBrains/Toolbox/scripts/<id>`
+/// - `/home/x/.local/share/JetBrains/Toolbox/bin/<id>`
+/// - Windows: `C:\Users\x\AppData\Local\JetBrains\Toolbox\scripts\<id>.exe`
+///
+/// program 起点 = 第一个非空白字节索引;
+/// program 终点 = `JetBrains/Toolbox/scripts/<id>` / `JetBrains/Toolbox/bin/<id>`
+///   子串终点之后的下个字节(应该是 ws 或行末)。
+///
+/// 返回 `Some((start, end))` —— caller 用 `&command[..start] + abs + &command[end..]` 拼接。
+fn toolbox_program_span(command: &str, id: &str) -> Option<(usize, usize)> {
+    // 找 marker 起点
+    let unix_scripts = format!("JetBrains/Toolbox/scripts/{id}");
+    let unix_bin = format!("JetBrains/Toolbox/bin/{id}");
+    let win_scripts = format!("JetBrains\\Toolbox\\scripts\\{id}.exe");
+    let win_bin = format!("JetBrains\\Toolbox\\bin\\{id}.exe");
+
+    let (marker_start, marker_end) = if let Some(idx) = command.find(&unix_scripts) {
+        (idx, idx + unix_scripts.len())
+    } else if let Some(idx) = command.find(&unix_bin) {
+        (idx, idx + unix_bin.len())
+    } else if let Some(idx) = command.find(&win_scripts) {
+        (idx, idx + win_scripts.len())
+    } else if let Some(idx) = command.find(&win_bin) {
+        (idx, idx + win_bin.len())
+    } else {
+        return None;
+    };
+
+    // program 起点:从 marker 往前回溯到第一个空白(然后 +1 跳过空白)。
+    let prefix = &command[..marker_start];
+    let ws_start = prefix.bytes().rev().take_while(|b| !b.is_ascii_whitespace()).count();
+    let program_start = marker_start - ws_start;
+    // 包含 marker 后续可选 `.exe`(Windows)
+    let mut program_end = marker_end;
+    while program_end < command.len()
+        && !command.as_bytes()[program_end].is_ascii_whitespace()
+    {
+        program_end += 1;
+    }
+    Some((program_start, program_end))
 }
 
 /// 对 builtin spec 走三段探测,找到绝对路径。复用了 scan_ide_entries 同样的链路。
@@ -846,6 +925,12 @@ fn detect_at_paths(fallback_paths: &[&str]) -> String {
 }
 
 /// JetBrains 专用:在 Toolbox bin 目录下找 `<id>` 这个 binary。
+///
+/// 两段探测:
+/// 1. Toolbox launcher(优先,只要 launcher 没损坏就用它 —— 它能正确转发 `--line {line} {file}` 等参数)
+/// 2. App bundle 直探测(.app/Contents/MacOS/<id>)——
+///    Toolbox launcher 损坏指向了已删除的 IDE 版本时(用户在 2026-09-11
+///    遇到的具体场景)的 fallback。glob 前缀不依赖年份后缀,IDE 升级不需要改。
 fn detect_jetbrains(id: &str) -> String {
     let home = match std::env::var_os("HOME") {
         Some(h) => h.to_string_lossy().into_owned(),
@@ -859,14 +944,7 @@ fn detect_jetbrains(id: &str) -> String {
         };
         let candidate = std::path::Path::new(&expanded).join(id);
         if candidate.is_file() {
-            if let Ok(content) = std::fs::read_to_string(&candidate) {
-                if let Some(real) = parse_toolbox_launcher(&content) {
-                    if std::path::Path::new(&real).is_file() {
-                        return real;
-                    }
-                }
-            }
-            break;
+            return candidate.to_string_lossy().into_owned();
         }
         #[cfg(target_os = "windows")]
         {
@@ -876,10 +954,66 @@ fn detect_jetbrains(id: &str) -> String {
             }
         }
     }
-    if let Some(found) = scan_jetbrains_app_in_applications(id, Some(&home)) {
-        return found;
+    detect_jetbrains_app_bundle(id).unwrap_or_default()
+}
+
+/// 在 `/Applications` 和 `~/Applications` 找匹配 `<glob>.app` 的 JetBrains app,
+/// 验证里面的 binary (`<id>`) 存在。返回 binary 绝对路径。
+///
+/// macOS only —— 其他平台直接返回 None。
+#[cfg(target_os = "macos")]
+fn detect_jetbrains_app_bundle(id: &str) -> Option<String> {
+    let product_glob = jetbrains_product_to_glob(id)?;
+    let home = std::env::var_os("HOME").map(|h| h.to_string_lossy().into_owned())?;
+    let roots = ["/Applications".to_string(), format!("{home}/Applications")];
+    let prefix_lc = product_glob.to_ascii_lowercase();
+    for root in &roots {
+        let dir = std::path::Path::new(root);
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let name_lc = name.to_ascii_lowercase();
+            if !name_lc.ends_with(".app") {
+                continue;
+            }
+            let stem = &name_lc[..name_lc.len() - ".app".len()];
+            if !stem.starts_with(&prefix_lc) {
+                continue;
+            }
+            // 找到候选 .app,验证 binary = `<id>` 真的在 Contents/MacOS/ 子目录下
+            let binary = entry.path().join("Contents").join("MacOS").join(id);
+            if binary.is_file() {
+                return Some(binary.to_string_lossy().into_owned());
+            }
+        }
     }
-    String::new()
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+fn detect_jetbrains_app_bundle(_id: &str) -> Option<String> {
+    None
+}
+
+/// JetBrains `<id>` → macOS .app 名 glob 前缀。
+/// 例:`"idea"` → `"IntelliJ IDEA"`(匹配 "IntelliJ IDEA.app" / "IntelliJ IDEA 2026.2.app")。
+fn jetbrains_product_to_glob(id: &str) -> Option<&'static str> {
+    match id {
+        "idea" => Some("IntelliJ IDEA"),
+        "webstorm" => Some("WebStorm"),
+        "clion" => Some("CLion"),
+        "pycharm" => Some("PyCharm"),
+        "phpstorm" => Some("PhpStorm"),
+        "goland" => Some("GoLand"),
+        "rider" => Some("Rider"),
+        "rubymine" => Some("RubyMine"),
+        "datagrip" => Some("DataGrip"),
+        "studio" => Some("Android Studio"),
+        _ => None,
+    }
 }
 
 /// 探测系统上已安装的 IDE。每个 builtin spec 走三段探测:
@@ -927,85 +1061,15 @@ fn scan_ide_entries() -> Vec<IdeEntry> {
 
 /// 把 command 模板("code --goto {file}:{line}")的 program 部分替换成 absolute_path。
 /// 找不到空格(program 后面没东西)就整段替换。
+///
+/// 只用于「原 command 的 program 是裸名」的场景 —— `scan_ide_entries` 写新条目时。
+/// 迁移旧 settings 里带空格绝对路径(Toolbox launcher 等)的 command 段用
+/// `toolbox_program_span` 直接定位 program 范围,不依赖 split whitespace。
 fn substitute_program(command: &str, absolute_path: &str) -> String {
     match command.find(char::is_whitespace) {
         Some(idx) => format!("{absolute_path}{}", &command[idx..]),
         None => absolute_path.to_string(),
     }
-}
-
-/// 从 Toolbox launcher (bash 脚本) 里解析真实 .app binary 路径。
-///
-/// Toolbox 生成的 launcher 形如:
-/// ```bash
-/// #!/bin/bash
-/// #Generated by JetBrains Toolbox ...
-/// ...
-/// open -na "/Users/yuchengfan/Applications/IntelliJ IDEA 2025.3.1.app/Contents/MacOS/idea" $wait --args "${intellij_args[@]}"
-/// ```
-///
-/// 只信任 `open -na "<...>"` 这种固定模式 —— 不解析其它任意 bash,
-/// 避免被特制脚本注入。返回 `Some("<abs path>")` 或 `None`。
-#[cfg(not(windows))]
-fn parse_toolbox_launcher(content: &str) -> Option<String> {
-    let first_line = content.lines().next()?;
-    if !first_line.starts_with("#!/bin/bash") && !first_line.starts_with("#!/bin/sh") {
-        return None;
-    }
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if !trimmed.starts_with("open ") && !trimmed.starts_with("open\t") {
-            continue;
-        }
-        if !trimmed.contains(" -na ") && !trimmed.contains(" -a ") {
-            continue;
-        }
-        let first_quote = trimmed.find('"')?;
-        let rest = &trimmed[first_quote + 1..];
-        let end_quote = rest.find('"')?;
-        let candidate = &rest[..end_quote];
-        if candidate.starts_with('/') && candidate.contains("/Contents/MacOS/") {
-            return Some(candidate.to_string());
-        }
-    }
-    None
-}
-
-#[cfg(windows)]
-fn parse_toolbox_launcher(_content: &str) -> Option<String> {
-    None
-}
-
-/// 在 `/Applications` + `~/Applications` 里找 `<id>.app` 命名的 JetBrains IDE。
-/// 找到后返回 `.app/Contents/MacOS/<id>` 的绝对路径。
-#[cfg(not(windows))]
-fn scan_jetbrains_app_in_applications(id: &str, home: Option<&str>) -> Option<String> {
-    let mut roots: Vec<std::path::PathBuf> = vec![std::path::PathBuf::from("/Applications")];
-    if let Some(h) = home {
-        roots.push(std::path::PathBuf::from(h).join("Applications"));
-    }
-    for root in &roots {
-        let entries = match std::fs::read_dir(root) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("app") {
-                continue;
-            }
-            let candidate = path.join("Contents/MacOS").join(id);
-            if candidate.is_file() {
-                return Some(candidate.to_string_lossy().into_owned());
-            }
-        }
-    }
-    None
-}
-
-#[cfg(windows)]
-fn scan_jetbrains_app_in_applications(_id: &str, _home: Option<&str>) -> Option<String> {
-    None
 }
 
 /// 是否属于 JetBrains 全家桶(用于走 `detect_jetbrains` 的 Toolbox bin 探测)。
@@ -1739,53 +1803,6 @@ mod ide_detection_tests {
     }
 
     #[test]
-    fn parse_toolbox_launcher_extracts_real_binary_path() {
-        // 真实 Toolbox 3.2 生成的 launcher 模板 —— 必须解析出 open -na 后面的路径
-        let content = r#"#!/bin/bash
-#Generated by JetBrains Toolbox 3.2.0.65851 at 2025-12-24T09:24:31
-
-declare -a intellij_args=()
-declare -- wait=""
-
-for o in "$@"; do
-  if [[ "$o" = "--wait" || "$o" = "-w" ]]; then
-    wait="-W"
-    o="--wait"
-  fi
-  if [[ "$o" =~ " " ]]; then
-    intellij_args+=("\"$o\"")
-  else
-    intellij_args+=("$o")
-  fi
-done
-
-open -na "/Users/yuchengfan/Applications/IntelliJ IDEA 2025.3.1.app/Contents/MacOS/idea" $wait --args "${intellij_args[@]}"
-"#;
-        let parsed = parse_toolbox_launcher(content);
-        assert_eq!(
-            parsed,
-            Some(
-                "/Users/yuchengfan/Applications/IntelliJ IDEA 2025.3.1.app/Contents/MacOS/idea"
-                    .to_string()
-            )
-        );
-    }
-
-    #[test]
-    fn parse_toolbox_launcher_rejects_non_bash_or_invalid_content() {
-        // 非 bash 脚本 → None
-        assert!(parse_toolbox_launcher("not a script").is_none());
-        // bash 但没有 open -na 调用 → None
-        assert!(parse_toolbox_launcher("#!/bin/bash\necho hi\n").is_none());
-        // bash 但 open 调用参数是相对路径或不含 /Contents/MacOS/ → None
-        let bad = "#!/bin/bash\nopen -na \"foo\" --args \"$@\"\n";
-        assert!(parse_toolbox_launcher(bad).is_none());
-        // bash + open 但不带 -na / -a(防止误匹配) → None
-        let bad2 = "#!/bin/bash\nopen \"http://example.com\"\n";
-        assert!(parse_toolbox_launcher(bad2).is_none());
-    }
-
-    #[test]
     fn builtin_ide_specs_contains_zed_and_codebuddy() {
         // 这两个是用户明确点名要的,必须出现在 builtin 里
         let ids: Vec<&str> = BUILTIN_IDE_SPECS.iter().map(|s| s.id).collect();
@@ -1853,6 +1870,24 @@ open -na "/Users/yuchengfan/Applications/IntelliJ IDEA 2025.3.1.app/Contents/Mac
         assert!(!needs_path_upgrade("/Applications/Zed.app/Contents/MacOS/cli {file}"));
         // Windows 反斜杠绝对路径 → 不需要
         assert!(!needs_path_upgrade(r"C:\Program Files\VS Code\bin\code.cmd {file}"));
+    }
+
+    #[test]
+    fn is_toolbox_launcher_path_recognizes_toolbox_paths() {
+        // Toolbox scripts/bin 路径 → 是 launcher
+        assert!(is_toolbox_launcher_path(
+            "/Users/x/Library/Application Support/JetBrains/Toolbox/scripts/idea --line {line} {file}"
+        ));
+        assert!(is_toolbox_launcher_path(
+            "/home/x/.local/share/JetBrains/Toolbox/bin/webstorm {file}"
+        ));
+        // Windows 反斜杠路径 → 是 launcher
+        assert!(is_toolbox_launcher_path(
+            r"C:\Users\x\AppData\Local\JetBrains\Toolbox\scripts\idea.exe --line {line} {file}"
+        ));
+        // 不是 Toolbox launcher
+        assert!(!is_toolbox_launcher_path("/Applications/IntelliJ IDEA.app/Contents/MacOS/idea --line {line} {file}"));
+        assert!(!is_toolbox_launcher_path("code --goto {file}"));
     }
 
     #[test]
@@ -1932,5 +1967,87 @@ open -na "/Users/yuchengfan/Applications/IntelliJ IDEA 2025.3.1.app/Contents/Mac
         let normalized = normalize_ide_entries(entries);
         assert_eq!(normalized.len(), 1);
         assert_eq!(normalized[0].id, "x");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn normalize_migrates_broken_toolbox_launcher_to_app_bundle() {
+        // 模拟用户在 2026-09-11 遇到的场景:Toolbox launcher 指向了已删除的 IDE 版本
+        // (实际是 `IntelliJ IDEA 2025.3.1.app` 不存在),导致启动失败。
+        // normalize_ide_entries 应该用 .app bundle 直探测找到 `IntelliJ IDEA.app`,
+        // 把 command 从 Toolbox launcher 替换成 `~/Applications/IntelliJ IDEA.app/Contents/MacOS/idea --line {line} {file}`。
+        let entry = IdeEntry {
+            id: "idea".to_string(),
+            label: "IntelliJ IDEA".to_string(),
+            command: "/Users/yuchengfan/Library/Application Support/JetBrains/Toolbox/scripts/idea --line {line} {file}".to_string(),
+            builtin: true,
+            hidden: false,
+        };
+        let normalized = normalize_ide_entries(vec![entry]);
+        assert_eq!(normalized.len(), 1);
+        let cmd = &normalized[0].command;
+        // 必须不再含 Toolbox launcher 路径
+        assert!(
+            !cmd.contains("Toolbox/scripts"),
+            "应该把 Toolbox launcher 替换掉,cmd={cmd}"
+        );
+        // 必须指向 .app bundle 内的 binary
+        assert!(
+            cmd.contains("IntelliJ IDEA") && cmd.contains("/Contents/MacOS/idea"),
+            "应该指向 .app bundle binary,cmd={cmd}"
+        );
+    }
+
+    #[test]
+    fn jetbrains_product_to_glob_covers_all_jetbrains_ids() {
+        // 所有 is_jetbrains_id() 返回 true 的 id 都必须有 glob 前缀,
+        // 否则 Toolbox launcher 失效时找不到 app bundle fallback
+        for id in [
+            "webstorm",
+            "idea",
+            "clion",
+            "pycharm",
+            "phpstorm",
+            "goland",
+            "rider",
+            "rubymine",
+            "datagrip",
+            "studio",
+        ] {
+            assert!(
+                jetbrains_product_to_glob(id).is_some(),
+                "{id} 应该有 glob 前缀"
+            );
+        }
+        // 非 JetBrains id → None
+        assert!(jetbrains_product_to_glob("code").is_none());
+        assert!(jetbrains_product_to_glob("zed").is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn detect_jetbrains_app_bundle_finds_installed_idea() {
+        // 这台测试机上实际装了 IntelliJ IDEA —— 至少 /Applications 或 ~/Applications 有一个能匹配
+        // (用户机器 2026-09-11 的真实场景:~/Applications/IntelliJ IDEA.app)
+        let home = std::env::var_os("HOME")
+            .map(|h| h.to_string_lossy().into_owned())
+            .expect("HOME 未设置");
+        let has_idea_in_apps =
+            std::path::Path::new("/Applications").join("IntelliJ IDEA.app").exists();
+        let has_idea_in_home = std::path::Path::new(&home)
+            .join("Applications")
+            .join("IntelliJ IDEA.app")
+            .exists();
+        if has_idea_in_apps || has_idea_in_home {
+            let result = detect_jetbrains_app_bundle("idea");
+            assert!(
+                result.is_some(),
+                "机器上装了 IntelliJ IDEA.app 但 glob 探测返回 None"
+            );
+            let path = result.unwrap();
+            assert!(path.contains("IntelliJ IDEA"), "路径应包含 .app 名,got={path}");
+            assert!(path.ends_with("/idea"), "应指向 .app/Contents/MacOS/idea,got={path}");
+        }
+        // 如果机器上完全没装 → 不做断言(避免 CI 环境失败)
     }
 }
