@@ -105,8 +105,26 @@ fn open_in_ide_blocking(path: String, project_path: String, ide_id: String) -> R
 
     // spawn 失败 → 返回错误让前端 toast;spawn 成功 → 直接返回 Ok(()),
     // IDE 进程由 OS 接管,即使 nezha 退出也不会被 kill(kill_on_drop=false 默认行为)
-    cmd.spawn().map_err(|e| format!("Failed to launch {}: {}", program, e))?;
+    cmd.spawn().map_err(|e| format_spawn_error(&program, &e))?;
     Ok(())
+}
+
+/// 把 `std::io::Error` 翻译成人话。`NotFound` 是最高频的失败模式 ——
+/// 通常是命令行里写的绝对路径过期了(IDE 升级 / JetBrains Toolbox launcher 失效等),
+/// 提示用户去 IDE 设置里修改 command。
+fn format_spawn_error(program: &str, err: &std::io::Error) -> String {
+    use std::io::ErrorKind;
+    match err.kind() {
+        ErrorKind::NotFound => format!(
+            "Failed to launch IDE: \"{program}\" not found. \
+             The path may be outdated (e.g. JetBrains Toolbox launcher pointing to a removed IDE). \
+             Update the IDE command in Settings → IDE. ({err})"
+        ),
+        ErrorKind::PermissionDenied => format!(
+            "Failed to launch IDE: permission denied for \"{program}\". ({err})"
+        ),
+        _ => format!("Failed to launch \"{program}\": {err}"),
+    }
 }
 
 #[cfg(test)]
@@ -163,5 +181,29 @@ mod tests {
             resolve_dir("/tmp/proj/does-not-exist-xyz.rs"),
             "/tmp/proj"
         );
+    }
+
+    #[test]
+    fn format_spawn_error_for_not_found_mentions_settings() {
+        // NotFound 是最高频失败模式(过期路径)—— 提示用户去设置改 command
+        let err = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let msg = format_spawn_error("/Users/yuchengfan/Applications/IntelliJ IDEA 2025.3.1.app/Contents/MacOS/idea", &err);
+        assert!(msg.contains("not found"), "msg={msg}");
+        assert!(msg.contains("Settings"), "应该提示去设置改路径,msg={msg}");
+    }
+
+    #[test]
+    fn format_spawn_error_for_permission_denied() {
+        let err = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let msg = format_spawn_error("code", &err);
+        assert!(msg.contains("permission denied"), "msg={msg}");
+    }
+
+    #[test]
+    fn format_spawn_error_for_other_kinds() {
+        let err = std::io::Error::from(std::io::ErrorKind::Interrupted);
+        let msg = format_spawn_error("code", &err);
+        assert!(msg.contains("Failed to launch"), "msg={msg}");
+        assert!(msg.contains("code"), "msg={msg}");
     }
 }
